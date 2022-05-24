@@ -24,7 +24,7 @@
 // Vbatt Pins
 #define VBATT                 (14)
 // LoRa Defines
-#define LORA_PACKET_SIZE      (53)        // bytes
+#define LORA_PACKET_SIZE      (33)        // bytes
 #define LORA_FREQ             (868.0)     // MHz
 #define LORA_SF               (7)
 
@@ -38,6 +38,8 @@
 #define GROUND_ALT_THRESHOLD  (50)        // meters
 #define MOTOR_BURNOUT         (1000)      // milliseconds
 #define TOUCHDOWN_DELAY       (10000)     // milliseconds
+#define APOGEE_THRESHOLD      (50)        //5 meters below apogee altitude (altitude multiplied by 10 to avoid float)
+#define NUM_READINGS          (50)        //Number of readings in the moving average
 
 // ======================================================== Hardware Interfaces ========================================================
 
@@ -59,24 +61,14 @@ struct ACCEL
   float y;
   float z;
 };
-struct GYRO
-{
-  float x;
-  float y;
-  float z;
-};
-struct TEMP
-{
-  float mpu;
-  float bmp;
-};
+
 
 // ======================================================== Global Variables ========================================================
 
 // LoRa Variables
 RH_RF95 rf95(TE_CS_PIN, TE_INT_PIN);
 uint8_t lora_packet[LORA_PACKET_SIZE];
-float lora_rssi = 0;
+int16_t lora_rssi = 0;
 
 // MPU Variables
 Adafruit_MPU6050 mpu;
@@ -105,13 +97,16 @@ uint16_t touchdown_delay = 0;
 uint16_t touchdown_timer = 0;
 uint8_t touchdown_status = 0;
 uint8_t first_execute = true;
-uint16_t ground_altitude = 0;
-uint16_t ground_pressure = 0;
-
+float ground_altitude = 0;
+float ground_pressure = 0;
+float mean_alti = 0; //current altitude through filter
+float max_alti = 0;
+float total = 0; //for the filter
+float readings [NUM_READINGS]; //table of readings
+uint8_t avgIndex  = 0; //Index
+uint32_t timestamp = 0;
 // Sensor Variables
 ACCEL accel_data;
-GYRO gyro_data;
-TEMP temp_data;
 ACCEL accel_calib;
 float pressure;
 float est_altitude;
@@ -131,6 +126,7 @@ void lora_rx_handle(void);
 void lora_parse(uint8_t *buffer);
 void state_update(void);
 uint8_t liftoff_detect(void);
+float alti_filter(void);
 uint8_t apogee_detect(void);
 uint8_t touchdown_detect(void);
 void battery_level_read(void);
@@ -159,7 +155,7 @@ void setup() {
   rf95.setTxPower(12, false);
   rf95.setFrequency(LORA_FREQ);
   rf95.setSpreadingFactor(LORA_SF);
-
+  
   // Sensor init
   MPU_init();
   BMP_init();
@@ -178,14 +174,14 @@ void setup() {
     accel_calib.z += a.acceleration.z/20;
     delay(100);
   }
-
+  delay(2000);
   //Serial.println("Initialization Complete.");
   //Serial.println("SanPellegrionique Ready for flight.");
 }
 
 // ======================================================== Loop ========================================================
 void loop() {
-
+  timestamp = millis();
   // Data Acquisition Handle
   MPU_read();
   BMP_read();
@@ -195,8 +191,8 @@ void loop() {
   state_update();
 
   // LoRa Handle
-  lora_packet_build();
-  lora_tx_handle();
+  //lora_packet_build();
+  //lora_tx_handle();
   //lora_rx_handle();
 
 }
@@ -210,13 +206,9 @@ void MPU_init(void) {
       delay(10);
     }
   }
-  Serial.println("MPU6050 Found!");
   mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
-  Serial.println("Accelerometer set to 16G!");
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  Serial.println("Gyro range set to 500deg!");
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  Serial.println("Filter bandwidth set to 21Hz!");
 }
 
 void MPU_read(void) {
@@ -225,10 +217,6 @@ void MPU_read(void) {
   accel_data.x = a.acceleration.x - accel_calib.x;
   accel_data.y = a.acceleration.y - accel_calib.y;
   accel_data.z = a.acceleration.z - accel_calib.z;
-  gyro_data.x = g.gyro.x;
-  gyro_data.y = g.gyro.y;
-  gyro_data.z = g.gyro.z;
-  temp_data.mpu = temp.temperature;
 
   /*Serial.print("Acceleration X: ");
   Serial.print(accel_data.x);
@@ -254,16 +242,7 @@ void MPU_read(void) {
 }
 
 void BMP_init(void) {
-  if (!bmp.begin(0x76)) {
-    Serial.println(F("Could not find a valid BMP280 sensor, check wiring or "
-                      "try a different address!"));
-    Serial.print("SensorID was: 0x"); Serial.println(bmp.sensorID(),16);
-    Serial.print("        ID of 0xFF probably means a bad address, a BMP 180 or BMP 085\n");
-    Serial.print("   ID of 0x56-0x58 represents a BMP 280,\n");
-    Serial.print("        ID of 0x60 represents a BME 280.\n");
-    Serial.print("        ID of 0x61 represents a BME 680.\n");
-    while (1) delay(10);
-  }
+  bmp.begin(0x76);
   bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
                   Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
                   Adafruit_BMP280::SAMPLING_X8,    /* Pressure oversampling */
@@ -273,9 +252,9 @@ void BMP_init(void) {
 
 void BMP_read(void) {
 
-  temp_data.bmp = bmp.readTemperature();
   pressure = bmp.readPressure();
-  est_altitude = bmp.readAltitude(ground_pressure) - ground_altitude;
+  //est_altitude = bmp.readAltitude(ground_pressure) - ground_altitude;
+  est_altitude = bmp.readAltitude(ground_pressure/100) - ground_altitude;
 
   /*Serial.print(F("Temperature = "));
   Serial.print(bmp.readTemperature());
@@ -294,7 +273,7 @@ void lora_packet_build(void) {
   uint8_t temp_buffer[sizeof(float)];
 
   // Timestamp
-  memcpy(temp_buffer, &(temp.timestamp), sizeof(float));
+  memcpy(temp_buffer, &(timestamp), sizeof(float));
   lora_packet[0] = temp_buffer[0];
   lora_packet[1] = temp_buffer[1];
   lora_packet[2] = temp_buffer[2];
@@ -316,60 +295,33 @@ void lora_packet_build(void) {
   lora_packet[13] = temp_buffer[1];
   lora_packet[14] = temp_buffer[2];
   lora_packet[15] = temp_buffer[3];
-  memcpy(temp_buffer, &(gyro_data.x), sizeof(float));
+
+  memcpy(temp_buffer, &pressure, sizeof(float));
   lora_packet[16] = temp_buffer[0];
   lora_packet[17] = temp_buffer[1];
   lora_packet[18] = temp_buffer[2];
   lora_packet[19] = temp_buffer[3];
-  memcpy(temp_buffer, &(gyro_data.y), sizeof(float));
+  memcpy(temp_buffer, &est_altitude, sizeof(float));
   lora_packet[20] = temp_buffer[0];
   lora_packet[21] = temp_buffer[1];
   lora_packet[22] = temp_buffer[2];
   lora_packet[23] = temp_buffer[3];
-  memcpy(temp_buffer, &(gyro_data.z), sizeof(float));
+
+  // Battery Levels
+  memcpy(temp_buffer, &v_batt, sizeof(float));
   lora_packet[24] = temp_buffer[0];
   lora_packet[25] = temp_buffer[1];
   lora_packet[26] = temp_buffer[2];
   lora_packet[27] = temp_buffer[3];
 
-  // Baro Data
-  memcpy(temp_buffer, &(temp_data.mpu), sizeof(float));
-  lora_packet[28] = temp_buffer[0];
-  lora_packet[29] = temp_buffer[1];
-  lora_packet[30] = temp_buffer[2];
-  lora_packet[31] = temp_buffer[3];
-  memcpy(temp_buffer, &(temp_data.bmp), sizeof(float));
-  lora_packet[32] = temp_buffer[0];
-  lora_packet[33] = temp_buffer[1];
-  lora_packet[34] = temp_buffer[2];
-  lora_packet[35] = temp_buffer[3];
-
-  memcpy(temp_buffer, &pressure, sizeof(float));
-  lora_packet[36] = temp_buffer[0];
-  lora_packet[37] = temp_buffer[1];
-  lora_packet[38] = temp_buffer[2];
-  lora_packet[39] = temp_buffer[3];
-  memcpy(temp_buffer, &est_altitude, sizeof(float));
-  lora_packet[40] = temp_buffer[0];
-  lora_packet[41] = temp_buffer[1];
-  lora_packet[42] = temp_buffer[2];
-  lora_packet[43] = temp_buffer[3];
-
-  // Battery Levels
-  memcpy(temp_buffer, &v_batt, sizeof(float));
-  lora_packet[44] = temp_buffer[0];
-  lora_packet[45] = temp_buffer[1];
-  lora_packet[46] = temp_buffer[2];
-  lora_packet[47] = temp_buffer[3];
-
   // Status
-  lora_packet[48] = current_state;
+  lora_packet[28] = current_state;
 
   memcpy(temp_buffer, &(lora_rssi), sizeof(float));
-  lora_packet[49] = temp_buffer[0];
-  lora_packet[50] = temp_buffer[1];
-  lora_packet[51] = temp_buffer[2];
-  lora_packet[52] = temp_buffer[3];
+  lora_packet[29] = temp_buffer[0];
+  lora_packet[30] = temp_buffer[1];
+  lora_packet[31] = temp_buffer[2];
+  lora_packet[32] = temp_buffer[3];
 }
 
 void lora_tx_handle(){
@@ -429,12 +381,22 @@ void lora_tx_handle(){
 
 void state_update(void){
   //Serial.print("Current State: ");
-  //Serial.println(current_state);
+  Serial.println(current_state);
   switch(current_state){
     case IDLE:
       if(first_execute){
-        ground_pressure = bmp.readPressure();
-        ground_altitude = bmp.readAltitude(ground_pressure);
+        float sum_press = 0;
+        float sum_alti = 0;
+        for(int j = 0; j<10; j++){ //Average the 10 first measurements
+          ground_pressure = bmp.readPressure();
+          //Serial.println(ground_pressure);
+          ground_altitude = bmp.readAltitude(ground_pressure/100);
+          sum_press += ground_pressure;
+          sum_alti += ground_altitude;
+        }
+        ground_pressure = sum_press/10;
+        ground_altitude = sum_alti/10;
+        
         first_execute = false;
       }
       // if Telemetry command or vertical for a little while -> current_state = ARMED;
@@ -475,7 +437,7 @@ void state_update(void){
       break;
     case APOGEE:
       if(first_execute){
-        ematch_trigger(EMATCH);
+        //ematch_trigger(EMATCH);
         first_execute = false;
       }
       //no movement for a bit -> current_state = TOUCHDOWN
@@ -509,8 +471,39 @@ uint8_t liftoff_detect(void){
   return liftoff_status;
 }
 
-uint8_t apogee_detect(void){
+float alti_filter(void){
+  float mean;
+  BMP_read();
+  total -= readings[avgIndex]; //Substract value numReadings times ago (here 20)
+  readings[avgIndex] = est_altitude; //Multiply by 10 to remove float
+  total += readings[avgIndex]; //Add new value;
+  avgIndex++;
+  if(avgIndex>=NUM_READINGS){
+    avgIndex = 0;
+  }
+  mean = total/NUM_READINGS;
+  return mean;
+}
 
+uint8_t apogee_detect(void){
+  //Either certain threshold from max altitude or slope of altitude decreases. Doing threshold for now, slope if doesn't work
+  mean_alti = alti_filter();
+  //Threshold:
+  if(mean_alti > max_alti){ //Update max alti
+    max_alti = mean_alti;
+    apogee_status = false;
+  }
+  else if(max_alti - mean_alti > APOGEE_THRESHOLD){
+    apogee_status = true;
+    //Serial.println("Threshold passed");
+  }
+  /*Serial.print("Estimated altitude: ");
+  Serial.println(est_altitude);
+  Serial.print("Averaged altitude: ");
+  Serial.println(mean_alti);
+  Serial.print("Max alti: ");
+  Serial.print(max_alti);
+  Serial.println("\n");*/
   return apogee_status;
 }
 
@@ -535,5 +528,5 @@ void ematch_trigger(uint8_t ematch){
 void battery_level_read(void){
   v_batt = analogRead(VBATT)*88.0/68.0*3.3/1024;
   //Serial.print("Vbatt: ");
-  Serial.println(v_batt);
+  //Serial.println(v_batt);
 }
